@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Living Image</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0a0a; overflow: hidden; }
+  canvas { display: block; position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); }
+</style>
+</head>
+<body>
+<script type="module">
+import * as THREE from './vendor/three.module.min.js';
+
+// ?debug 를 붙이면 깊이/마스크 맵을 겹쳐서 보여준다 (좌표 튜닝용)
+const DEBUG = new URLSearchParams(location.search).has('debug');
+// ?t=1.5 로 시간을 고정하면 특정 프레임을 정지 상태로 확인할 수 있다
+const FIXED_T = new URLSearchParams(location.search).get('t');
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 10);
+camera.position.z = 1;
+
+const tex = await new THREE.TextureLoader().loadAsync('./image.jpg');
+tex.colorSpace = THREE.SRGBColorSpace;
+tex.minFilter = THREE.LinearMipmapLinearFilter;
+tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+
+const uniforms = {
+  uTex: { value: tex },
+  uTime: { value: 0 },
+  uPointer: { value: new THREE.Vector2() },
+  uDebug: { value: DEBUG ? 1 : 0 },
+};
+
+const material = new THREE.ShaderMaterial({
+  uniforms,
+  vertexShader: /* glsl */`
+    varying vec2 vUv;
+    void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }
+  `,
+  fragmentShader: /* glsl */`
+    precision highp float;
+    varying vec2 vUv;
+    uniform sampler2D uTex;
+    uniform float uTime;
+    uniform vec2 uPointer;
+    uniform float uDebug;
+
+    // 좌표계: p = (0,0) 좌상단, (1,1) 우하단 — 원본 이미지 픽셀/1792 와 동일
+    float ell(vec2 p, vec2 c, vec2 r) {
+      return smoothstep(1.0, 0.55, length((p - c) / r));
+    }
+
+    // 손으로 잡은 근사 깊이맵: 0 = 뒤쪽 문, 1 = 세탁기 테두리(카메라 바로 앞)
+    float depthMap(vec2 p) {
+      float d = 0.0;
+      d = max(d, 0.50 * ell(p, vec2(0.20, 0.50), vec2(0.23, 0.46)));   // 왼쪽 인물
+      d = max(d, 0.55 * ell(p, vec2(0.77, 0.47), vec2(0.20, 0.44)));   // 오른쪽 인물
+      d = max(d, 0.72 * ell(p, vec2(0.48, 0.60), vec2(0.18, 0.44)));   // 가운데 인물 (몸을 숙여 가장 가까움)
+      d = max(d, 0.85 * ell(p, vec2(0.887, 0.368), vec2(0.125, 0.125))); // 말풍선
+      float rim = smoothstep(0.97, 1.06, length((p - vec2(0.5, 0.42)) / vec2(0.465, 0.425)));
+      return max(d, rim);
+    }
+
+    // 머리카락 끝부분 마스크
+    float hairMask(vec2 p) {
+      float m = 0.0;
+      m += ell(p, vec2(0.09, 0.40), vec2(0.08, 0.22));  // 금발 왼쪽
+      m += ell(p, vec2(0.30, 0.50), vec2(0.07, 0.20));  // 금발 오른쪽 가닥
+      m += ell(p, vec2(0.365, 0.60), vec2(0.045, 0.22)); // 빨강 왼쪽
+      m += ell(p, vec2(0.60, 0.58), vec2(0.045, 0.20)); // 빨강 오른쪽
+      m += ell(p, vec2(0.625, 0.33), vec2(0.04, 0.09)); // 단발 왼쪽 끝
+      m += ell(p, vec2(0.835, 0.36), vec2(0.04, 0.09)); // 단발 오른쪽 끝
+      return clamp(m, 0.0, 1.0);
+    }
+
+    vec2 breathe(vec2 p, vec2 c, vec2 r, float phase) {
+      float m = ell(p, c, r);
+      float s = sin(uTime * 1.25 + phase);
+      // 흉곽 중심 기준으로 살짝 팽창 + 위로 들림
+      return m * ((p - c) * 0.014 * s + vec2(0.0, 0.0030 * s));
+    }
+
+    void main() {
+      vec2 p = vec2(vUv.x, 1.0 - vUv.y);
+      // 가장자리가 드러나지 않도록 약간 확대
+      p = (p - 0.5) * 0.955 + 0.5;
+
+      float rim = smoothstep(0.97, 1.06, length((p - vec2(0.5, 0.42)) / vec2(0.465, 0.425)));
+      float inside = 1.0 - rim;
+      float d = depthMap(p);
+
+      vec2 disp = vec2(0.0);
+
+      // 1) 시차: 포인터 + 느린 자동 흔들림
+      vec2 drift = vec2(sin(uTime * 0.37), cos(uTime * 0.29)) * 0.35;
+      vec2 par = uPointer + drift;
+      disp += (d - 0.45) * par * 0.022;
+
+      // 2) 호흡 (인물마다 위상 다르게), 세탁기 테두리에는 적용 안 함
+      vec2 b = vec2(0.0);
+      b += breathe(p, vec2(0.21, 0.56), vec2(0.20, 0.26), 0.0);
+      b += breathe(p, vec2(0.48, 0.60), vec2(0.15, 0.24), 2.1);
+      b += breathe(p, vec2(0.79, 0.53), vec2(0.15, 0.24), 4.0);
+      disp += b * inside;
+
+      // 말풍선 글자가 일그러지지 않도록 머리/머리카락 변형에서 제외
+      float notBubble = smoothstep(0.95, 1.2, length((p - vec2(0.887, 0.368)) / vec2(0.115)));
+
+      // 3) 머리카락 흔들림
+      float hm = hairMask(p) * inside * notBubble;
+      disp.x += hm * 0.0035 * sin(uTime * 1.6 + p.y * 9.0 + p.x * 4.0);
+
+      // 4) 오른쪽 인물: 주기적으로 웃으며 고개 까딱 + 말풍선 팝
+      float laugh = smoothstep(0.55, 0.9, sin(uTime * 0.7)) ;
+      float head = ell(p, vec2(0.715, 0.25), vec2(0.13, 0.19)) * inside * notBubble;
+      disp.y += head * laugh * 0.0045 * abs(sin(uTime * 7.0));
+      vec2 bc = vec2(0.887, 0.368);
+      float bub = ell(p, bc, vec2(0.13, 0.13));
+      disp += bub * (p - bc) * (0.025 * laugh * sin(uTime * 7.0) + 0.012 * sin(uTime * 2.0));
+
+      vec2 uv = clamp(p - disp, 0.001, 0.999);
+      vec3 col = texture2D(uTex, vec2(uv.x, 1.0 - uv.y)).rgb;
+
+      // 5) 조명: 문 뒤 역광이 은은하게 숨쉬고, 드럼 안쪽은 비네트
+      float glow = ell(p, vec2(0.5, 0.12), vec2(0.45, 0.35)) * inside;
+      col *= 1.0 + glow * 0.07 * sin(uTime * 0.9);
+      float vig = smoothstep(0.78, 0.38, length(p - vec2(0.5, 0.46)));
+      col *= mix(0.72, 1.0, vig);
+
+      if (uDebug > 0.5) {
+        col = mix(col, vec3(d, hm, head + bub), 0.6);
+      }
+      gl_FragColor = vec4(col, 1.0);
+      #include <colorspace_fragment>
+    }
+  `,
+});
+scene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material));
+
+// 드럼 안을 떠다니는 먼지 — 이미지 앞쪽 레이어로 깊이감 보강
+const N = 140;
+const pos = new Float32Array(N * 3), seed = new Float32Array(N);
+for (let i = 0; i < N; i++) {
+  pos[i * 3] = Math.random() * 2 - 1;
+  pos[i * 3 + 1] = Math.random() * 2 - 1;
+  pos[i * 3 + 2] = 0.5;
+  seed[i] = Math.random();
+}
+const dustGeo = new THREE.BufferGeometry();
+dustGeo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+dustGeo.setAttribute('aSeed', new THREE.BufferAttribute(seed, 1));
+const dust = new THREE.Points(dustGeo, new THREE.ShaderMaterial({
+  transparent: true, depthTest: false, blending: THREE.AdditiveBlending,
+  uniforms: { uTime: uniforms.uTime, uPointer: uniforms.uPointer, uScale: { value: 1 } },
+  vertexShader: /* glsl */`
+    attribute float aSeed;
+    uniform float uTime; uniform vec2 uPointer; uniform float uScale;
+    varying float vA;
+    void main() {
+      vec3 q = position;
+      float t = uTime * (0.02 + aSeed * 0.03);
+      q.x = mod(q.x + 1.0 + sin(uTime * 0.3 + aSeed * 40.0) * 0.03 + t * 0.4, 2.0) - 1.0;
+      q.y = mod(q.y + 1.0 + t, 2.0) - 1.0;
+      q.xy -= uPointer * (0.02 + aSeed * 0.05);   // 가까운 먼지일수록 시차가 크다
+      vA = (0.25 + 0.75 * aSeed) * (0.5 + 0.5 * sin(uTime * 1.5 + aSeed * 90.0));
+      gl_Position = vec4(q.xy, 0.0, 1.0);
+      gl_PointSize = (1.5 + aSeed * 5.0) * uScale;
+    }
+  `,
+  fragmentShader: /* glsl */`
+    varying float vA;
+    void main() {
+      float r = length(gl_PointCoord - 0.5);
+      gl_FragColor = vec4(vec3(1.0, 0.93, 0.82), smoothstep(0.5, 0.0, r) * vA * 0.35);
+    }
+  `,
+}));
+scene.add(dust);
+
+function resize() {
+  const s = Math.min(innerWidth, innerHeight);
+  renderer.setSize(s, s);
+  dust.material.uniforms.uScale.value = (s / 900) * renderer.getPixelRatio();
+}
+addEventListener('resize', resize);
+resize();
+
+const target = new THREE.Vector2();
+addEventListener('pointermove', (e) => {
+  const r = renderer.domElement.getBoundingClientRect();
+  target.set(
+    THREE.MathUtils.clamp(((e.clientX - r.left) / r.width) * 2 - 1, -1.5, 1.5),
+    THREE.MathUtils.clamp(((e.clientY - r.top) / r.height) * 2 - 1, -1.5, 1.5),
+  );
+});
+addEventListener('pointerleave', () => target.set(0, 0));
+// 모바일: 기기 기울기로 시차
+addEventListener('deviceorientation', (e) => {
+  if (e.gamma == null) return;
+  target.set(THREE.MathUtils.clamp(e.gamma / 30, -1, 1), THREE.MathUtils.clamp((e.beta - 45) / 30, -1, 1));
+});
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  uniforms.uTime.value = FIXED_T !== null ? parseFloat(FIXED_T) : clock.getElapsedTime();
+  uniforms.uPointer.value.lerp(target, 0.06);
+  renderer.render(scene, camera);
+});
+window.__ready = true;
+</script>
+</body>
+</html>
